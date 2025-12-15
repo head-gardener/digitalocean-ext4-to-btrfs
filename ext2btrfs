@@ -3,28 +3,57 @@
 
 set -e
 
+RECOVERY="${RECOVERY:-}"
+REBOOT="${REBOOT:-}"
+
 #apt-get update
 apt-get install -y btrfs-progs
 apt-get install -y busybox-static
 
 mount -t tmpfs ramdisk /mnt
 
-mkdir /mnt/{proc,sys,dev}
+mkdir /mnt/{old,proc,sys,dev,run}
 
 mkdir -p /mnt/{bin,sbin,usr/bin,usr/sbin}
 
-#cp /bin/bash /mnt/bin
-#for f in $(ldd /bin/bash | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
-#ln -s bash /mnt/bin/sh
-
-cp /bin/busybox /mnt/bin
+busybox="$(which busybox)"
+cp "$busybox" /mnt/bin
 /mnt/bin/busybox --install /mnt/bin
 
-cp /sbin/btrfs-convert /mnt/sbin
-for f in $(ldd /sbin/btrfs-convert | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
+btrfsconvert="$(which btrfs-convert)"
+cp "$btrfsconvert" /mnt/sbin
+for f in $(ldd "$btrfsconvert" | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do
+  [[ ! -f $f ]] && continue
+  mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f
+done
 
-cp /sbin/btrfs /mnt/sbin
-for f in $(ldd /sbin/btrfs | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
+btrfs="$(which btrfs)"
+cp "$btrfs" /mnt/sbin
+for f in $(ldd "$btrfs" | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do
+  [[ ! -f $f ]] && continue
+  mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f
+done
+
+strace="$(which strace)"
+cp "$strace" /mnt/sbin
+for f in $(ldd "$strace" | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do
+  [[ ! -f $f ]] && continue
+  mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f
+done
+
+e2fsck="$(which e2fsck)"
+cp "$e2fsck" /mnt/sbin
+for f in $(ldd "$e2fsck" | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do
+  [[ ! -f $f ]] && continue
+  mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f
+done
+
+umount="$(which umount)"
+cp "$umount" /mnt/sbin
+for f in $(ldd "$umount" | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do
+  [[ ! -f $f ]] && continue
+  mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f
+done
 
 #cat > /mnt/init <<'EOF'
 ##!/bin/bash
@@ -71,10 +100,22 @@ for f in $(ldd /sbin/btrfs | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'
 #reboot -f
 #EOF
 
-cat > /mnt/init <<'EOF'
+root="$(findmnt / --first-only --noheadings -o SOURCE)"
+root_dev="$(echo "$root" | sed 's/[0-9]\+$//')"
+
+cat > /mnt/init <<EOF
 #!/bin/sh
 
 set -e
+
+root="$root"
+root_dev="$root_dev"
+RECOVERY="$RECOVERY"
+REBOOT="$REBOOT"
+
+EOF
+
+cat >> /mnt/init <<'EOF'
 
 on_exit() {
    rc="$?"
@@ -84,63 +125,60 @@ on_exit() {
         sleep 1
         echo -n '.'
      done
-     echo
      sync
-     reboot -f
+     [ -n "$REBOOT" ] && reboot -f
    else
      echo "=== init failed: opening shell ==="
      sync
-     /bin/sh
+     [ -n "$RECOVERY" ] && /bin/sh
    fi
 }
 
 trap on_exit EXIT
 
-clear
+echo "=== unmounting old root ==="
+umount -l "$root"
+timeout 5s sh -c "until mount '$root' /old; do sleep 1; done"
+timeout 5s sh -c "until umount '$root'; do sleep 1; done"
+
 echo "=== starting init ==="
 
-echo "=== unmounting old root ==="
-umount -l /dev/vda1
-sleep 5
-mount /dev/vda1 /mnt
-umount /dev/vda1
-
 echo "=== converting to btrfs ==="
-/sbin/btrfs-convert -L /dev/vda1
+/sbin/btrfs-convert -L "$root"
 
 echo "=== mounting btrfs root ==="
-mount /dev/vda1 /mnt
+mount "$root" /old
 
 echo "=== removing ext4 snapshot ==="
-btrfs subvolume delete /mnt/ext2_saved
+btrfs subvolume delete /old/ext2_saved
 
 echo "=== defragging ==="
-btrfs filesystem defrag -r /mnt
+btrfs filesystem defrag -r /old
 
 echo "=== rebalancing ==="
-btrfs balance start /mnt
+btrfs balance start /old
 
 echo "=== updating fstab ==="
-sed -i -e 's/\(LABEL=DOROOT.*\)ext4/\1btrfs/' /mnt/etc/fstab
-sed -i -e 's/errors=remount-ro/defaults/' /mnt/etc/fstab
+sed -i -e 's/\(LABEL=DOROOT.*\)ext4/\1btrfs/' /old/etc/fstab
+sed -i -e 's/errors=remount-ro/defaults/' /old/etc/fstab
 
 echo "=== reinstalling grub ==="
-mount -t proc proc /mnt/proc
-mount -t sysfs sys /mnt/sys
-mount -o bind /dev /mnt/dev
-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
-chroot /mnt grub-install /dev/vda
+mount -t proc proc /old/proc
+mount -t sysfs sys /old/sys
+mount -o bind /dev /old/dev
+chroot /old grub-mkconfig -o /boot/grub/grub.cfg
+chroot /old grub-install "$root_dev"
 
 echo "=== rebuilding initramfs ==="
-for pkg in $(chroot /mnt /usr/bin/dpkg -l 'linux-image-*-*' | grep ^ii | awk '{print $2}'); do
-    chroot /mnt /usr/sbin/dpkg-reconfigure $pkg
+for pkg in $(chroot /old /usr/bin/dpkg -l 'linux-image-*-*' | grep ^ii | awk '{print $2}'); do
+    chroot /old /usr/sbin/dpkg-reconfigure $pkg
 done
 
 echo "=== unmounting root ==="
-umount /mnt/dev
-umount /mnt/sys
-umount /mnt/proc
-umount /mnt
+umount /old/dev
+umount /old/sys
+umount /old/proc
+umount /old
 sync
 
 EOF
@@ -152,4 +190,19 @@ modprobe btrfs
 
 sleep 1
 trap - EXIT
-systemctl switch-root /mnt /init
+
+mount --types proc /proc /mnt/proc
+mount --rbind /sys /mnt/sys
+mount --make-rslave /mnt/sys
+mount --rbind /dev /mnt/dev
+mount --make-rslave /mnt/dev
+mount --bind /run /mnt/run
+mount --make-slave /mnt/run
+
+# pivot_root won't work with MS_SHARED
+mount --make-private /
+mount --make-private /mnt
+
+cd /mnt
+pivot_root . old
+exec chroot . /init
