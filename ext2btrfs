@@ -1,10 +1,10 @@
-#!/bin/bash
+#! /usr/bin/env bash
 # scp ext2btrfs root@12.345.678.912: && ssh root@12.345.678.912 bash ext2btrfs
 
 set -e
 
 #apt-get update
-apt-get install -y btrfs-tools
+apt-get install -y btrfs-progs
 apt-get install -y busybox-static
 
 mount -t tmpfs ramdisk /mnt
