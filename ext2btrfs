@@ -1,155 +1,280 @@
-#!/bin/bash
-# scp ext2btrfs root@12.345.678.912: && ssh root@12.345.678.912 bash ext2btrfs
+#! /usr/bin/env bash
 
-set -e
+set -e $@
 
-#apt-get update
-apt-get install -y btrfs-tools
-apt-get install -y busybox-static
+RECOVERY="${RECOVERY:-}"
+REBOOT="${REBOOT:-}"
+INIT_OPTS="${INIT_OPTS:-}"
+
+# exit 0
+
+# systemd -> /usr/lib/systemd/systemd
+abs() { # name
+  readlink -f "$(which "$1" || echo "$1")"
+}
+
+move() { # name
+  prog="$(abs "$1")"
+  dest="$2"
+  [ -z "$dest" ] && dest="/bin"
+  cp -v "$prog" "/mnt/$dest/" 1>&2
+  for f in $(ldd "$prog" | perl -ne '/(\/\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do
+    [ -f "/mnt/$f" -o ! -f "$f" ] && continue
+    mkdir -p "/mnt/${f%/*}"
+    cp -L "$f" "/mnt/$f"
+  done
+}
+
+#wrap() {
+#  libs="$(move "$1" 1 | sort -u | tr '\n' ':')"
+#  name="$(basename "$1")"
+#  tgt="/mnt/bin/$name-wrapper"
+#  cat > "$tgt" <<EOF
+##!/bin/sh
+#LD_LIBRARY_PATH="$libs" exec "/mnt/bin/$name" \$@
+#EOF
+#  chmod +x "$tgt"
+#  [ -n "$2" ] && echo "$tgt"
+#}
+
+echo "=== installing packages ==="
+
+pkgs() {
+  apt-get install -y btrfs-progs busybox-static
+}
+pkgs || { apt-get update; pkgs; }
+
+echo "=== building temporary root ==="
 
 mount -t tmpfs ramdisk /mnt
+mkdir /mnt/{old,proc,sys,dev,run}
+mkdir -p /mnt/{bin,usr/bin}
 
-mkdir /mnt/{proc,sys,dev}
+linker="$(ldd "$(which cat)" | grep "ld-linux" | awk '{ print $1 }')"
+echo "Detected dynamic linker $linker"
+cp -Lr "${linker%/*}" "/mnt${linker%/*}"
+# don't assume symlinks, just bind mount
+mount --bind "/mnt${linker%/*}" "${linker%/*}"
 
-mkdir -p /mnt/{bin,sbin,usr/bin,usr/sbin}
+echo '
+  blockdev
+  btrfs
+  btrfs-convert
+  e2fsck
+  fuser
+  iostat
+  lsns
+  lsof
+  sshd
+  strace
+  systemctl
+' | xargs -P 4 -I {} sh $@ -c "$(declare -f abs); $(declare -f move); move {}"
 
-#cp /bin/bash /mnt/bin
-#for f in $(ldd /bin/bash | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
-#ln -s bash /mnt/bin/sh
+# needed for btrfs-convert
+libgcc="$(find /usr/lib -name libgcc_s.so.1)"
+move "$libgcc" "/lib"
 
-cp /bin/busybox /mnt/bin
+busybox="$(abs busybox)"
+cp "$busybox" /mnt/bin
 /mnt/bin/busybox --install /mnt/bin
 
-cp /sbin/btrfs-convert /mnt/sbin
-for f in $(ldd /sbin/btrfs-convert | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
+root="$(findmnt / --first-only --noheadings -o SOURCE)"
+root_dev="$(echo "$root" | sed 's/[0-9]\+$//')"
+echo "Discovered root dev: $root_dev"
 
-cp /sbin/btrfs /mnt/sbin
-for f in $(ldd /sbin/btrfs | perl -ne '/(\S+) \(0x[a-z0-9]+\)/ and print "$1\n"'); do [[ ! -f $f ]] && continue; mkdir -p /mnt/${f%/*} && cp -v $f /mnt/$f; done
-
-#cat > /mnt/init <<'EOF'
-##!/bin/bash
-#
-#run_from_file() {
-#  local f t
-#  for f in /dev/fd/*; do
-#    [ -h $f ] || continue
-#    [ $f -ef "$0" ] && return
-#  done
-#  t=$(mktemp)
-#  cat > $t
-#  if [ "$(head -n 1 $t)" = '#!/bin/bash' ]; then
-#    chmod +x $t
-#    exec /bin/bash $t "$@" </dev/fd/2
-#  else
-#    rm -f $t
-#    echo "Direct execution not supported with this shell ($_)." >&2
-#    echo "Please try bash instead." >&2
-#    exit 1
-#  fi
-#}
-#
-## do not modify the two lines below
-#[ -h /dev/fd/0 ] && run_from_file
-##!/bin/bash
-#echo "=== starting init ==="
-#set -x
-#/bin/bash -l -i
-#set +x
-#echo "=== end of init. rebooting in 5s ==="
-#sleep 5
-#reboot -f
-#EOF
-
-#cat > /mnt/init <<'EOF'
-##!/bin/bash
-#echo "=== starting init ==="
-#set -x
-#/bin/bash -l -i
-#set +x
-#echo "=== end of init. rebooting in 5s ==="
-#sleep 5
-#reboot -f
-#EOF
-
-cat > /mnt/init <<'EOF'
+cat > /mnt/init <<EOF
 #!/bin/sh
 
-set -e
+set -e $INIT_OPTS
+
+root="$root"
+root_dev="$root_dev"
+RECOVERY="$RECOVERY"
+REBOOT="$REBOOT"
+PATH="/bin"
+
+EOF
+
+# TODO: replace daemon-reexec with kill
+cat >> /mnt/init <<'EOF'
+
+echo $$
 
 on_exit() {
    rc="$?"
    if [ "$rc" -eq 0 ]; then
-     echo "=== init done: rebooting in 5s ==="
-     for i in $(seq 1 5); do
-        sleep 1
-        echo -n '.'
-     done
-     echo
+     echo "=== init done ==="
      sync
-     reboot -f
+     [ -n "$REBOOT" ] && reboot -f
    else
-     echo "=== init failed: opening shell ==="
+     echo "=== init failed ==="
      sync
-     /bin/sh
+     [ -n "$RECOVERY" ] && /bin/sh
    fi
 }
 
 trap on_exit EXIT
 
-clear
-echo "=== starting init ==="
-
 echo "=== unmounting old root ==="
-umount -l /dev/vda1
-sleep 5
-mount /dev/vda1 /mnt
-umount /dev/vda1
+mount --move /old/proc /proc
 
-echo "=== converting to btrfs ==="
-/sbin/btrfs-convert -L /dev/vda1
-
-echo "=== mounting btrfs root ==="
-mount /dev/vda1 /mnt
-
-echo "=== removing ext4 snapshot ==="
-btrfs subvolume delete /mnt/ext2_saved
-
-echo "=== defragging ==="
-btrfs filesystem defrag -r /mnt
-
-echo "=== rebalancing ==="
-btrfs balance start /mnt
-
-echo "=== updating fstab ==="
-sed -i -e 's/\(LABEL=DOROOT.*\)ext4/\1btrfs/' /mnt/etc/fstab
-sed -i -e 's/errors=remount-ro/defaults/' /mnt/etc/fstab
-
-echo "=== reinstalling grub ==="
-mount -t proc proc /mnt/proc
-mount -t sysfs sys /mnt/sys
-mount -o bind /dev /mnt/dev
-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
-chroot /mnt grub-install /dev/vda
-
-echo "=== rebuilding initramfs ==="
-for pkg in $(chroot /mnt /usr/bin/dpkg -l 'linux-image-*-*' | grep ^ii | awk '{print $2}'); do
-    chroot /mnt /usr/sbin/dpkg-reconfigure $pkg
+while ms="$(mount | grep "on /old[^ ]" | awk '{ sub("^/old", "", $3); print $3 }')"; do
+  [ -z "$ms" ] && break
+  m="$(echo "$ms" | head -1)"
+  mkdir -p "$m"
+  mount --move "/old/$m" "/$m"
 done
 
-echo "=== unmounting root ==="
-umount /mnt/dev
-umount /mnt/sys
-umount /mnt/proc
-umount /mnt
-sync
+# systemctl daemon-reexec
 
+sync
+# /bin/sh
+fuser -SIGKILL --verbose --kill --mount /old
+umount -l "$root"
+sync
+# basically open($root, O_RDONLY | O_EXCL) with extra steps
+timeout 2s sh $INIT_OPTS -c "
+  while e2fsck -E journal_only -n '$root' 2>&1 | grep 'is in use' > /dev/null; do
+    sleep 1;
+  done"
+
+echo "=== converting to btrfs ==="
+/bin/btrfs-convert -L "$root"
+
+echo "=== mounting btrfs root ==="
+mount "$root" /old
+
+echo "=== removing ext4 snapshot ==="
+btrfs subvolume delete /old/ext2_saved
+
+echo "=== defragging ==="
+btrfs filesystem defrag -r /old
+
+echo "=== rebalancing ==="
+# not critical and may fail if there isn't enough space
+btrfs balance start /old --full-balance || true
+
+echo "=== fixing old root ==="
+rm /old/lib/systemd/systemd
+mv /old/systemd /old/lib/systemd/systemd
+
+# echo "=== updating fstab ==="
+# sed -i -e 's/\(\s*/\s*\)ext4/\1btrfs/' /old/etc/fstab
+# sed -i -e 's/errors=remount-ro/defaults/' /old/etc/fstab
+
+# echo "=== chrooting back ==="
+
+# mount --move /dev /old/dev
+# mount --move /sys /old/sys
+# mount --move /proc /old/proc
+# mount --move /mnt1 /old/mnt1
+# cd /old
+# pivot_root . mnt
+# exec /mnt/bin/chroot . /sbin/init
+# exec chroot /old /sbin/init
+
+# echo "=== reinstalling grub ==="
+# mount -t proc proc /old/proc
+# mount -t sysfs sys /old/sys
+# mount -o bind /dev /old/dev
+# chroot /old grub-mkconfig -o /boot/grub/grub.cfg
+# chroot /old grub-install "$root_dev"
 EOF
 
 chmod 0755 /mnt/init
 
+echo "=== evicting systemd ==="
+
+#path="$(find /proc/1/fd -type l | xargs -n1 readlink | grep "systemd-executor" || true)"
+#if [ -z "$path" ]; then
+#  echo "Couldn't find systemd-executor!"
+#  exit 1
+#fi
+#libs="$(move "$path" 1 | sort -u | tr '\n' ':')"
+#name="systemd-executor"
+#wrapper="/mnt/bin/$name-wrapper"
+#cat > "$wrapper" <<EOF
+##!/bin/sh
+#LD_LIBRARY_PATH="$libs" exec "/mnt/bin/$name" \$@
+#EOF
+#chmod +x "$wrapper"
+#mv "$(readlink -f "$path")" /systemd-executor
+#ln -s "$wrapper" "$path"
+
+# libs="$(move "systemd" 1 | sort -u | tr '\n' ':')"
+name="systemd"
+wrapper="/mnt/bin/$name-wrapper"
+cat > "$wrapper" <<EOF
+#!/bin/sh
+
+set -ex
+
+cd /mnt
+pivot_root . old
+/bin/mount --move /old/dev /dev
+exec /bin/chroot . /bin/sh -c '
+  /init 2>&1 | /bin/tr "\n" "\0" | /bin/xargs -0 -n1 /bin/echo "<3>" > /dev/kmsg
+'
+EOF
+chmod +x "$wrapper"
+sysd="$(abs systemd)"
+mv $sysd /systemd
+ln -s "$wrapper" $sysd
+
+# if find /proc/1/maps -type l \
+#     | xargs -n1 readlink \
+#     | xargs -n1 findmnt --nohead -o TARGET -T \
+#     | grep "^/$"; then
+#   echo "Couldn't evict systemd! Some files are still mapped from the root."
+#   echo "Contents of /proc/1/maps:"
+#   cat /proc/1/maps
+#   exit 1
+# fi
+
+# if find /proc/1/fd -type l \
+#     | xargs -n1 readlink \
+#     | xargs -n1 findmnt --nohead -o TARGET -T \
+#     | grep "^/$"; then
+#   echo "Couldn't evict systemd! Some files is still open on the root."
+#   echo "Contents of /proc/1/fd:"
+#   ls -l /proc/1/fd
+#   exit 1
+# fi
+
+echo "=== stopping all units ==="
+
+preserve="ssh|cloud-init|tty|journald"
+
+systemctl list-units --type=socket --plain --no-legend \
+  | cat | awk '{ print $1 }' >> /sysd-state
+systemctl list-units --type=service --state=running --plain --no-legend \
+  | cat | awk '{ print $1 }' > /sysd-state
+systemctl list-units --type=socket --plain --no-legend \
+  | cat | grep -Ev "$preserve"| awk '{ print $1 }' | xargs systemctl stop
+systemctl list-units --type=service --state=running --plain --no-legend \
+  | cat | grep -Ev "$preserve" | awk '{ print $1 }' | xargs -t systemctl stop
+
+echo "=== switching root ==="
+
 losetup -D || true
 modprobe btrfs
 
-sleep 1
-trap - EXIT
-systemctl switch-root /mnt /init
+# pivot_root won't work with MS_SHARED
+mount --make-slave /
+mount --make-slave /mnt
+
+# exit 0
+
+cd /mnt
+# /mnt/bin/strace -v -s 4096 -x -e signal=all -e trace=all -yy -p 1 & 2>&1 \
+#   | /mnt/bin/tr "\n" "\0" | /mnt/bin/xargs -0 -n1 /mnt/bin/echo "<3>" > /dev/kmsg
+# disown %1
+
+/mnt/bin/sh -c '
+  while ! systemctl is-active cloud-init.target >/dev/null; do
+    sleep 1
+  done;
+
+  exec systemctl daemon-reexec
+' &
+disown %1
