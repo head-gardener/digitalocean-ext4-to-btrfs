@@ -5,15 +5,16 @@ set -e $@
 RECOVERY="${RECOVERY:-}"
 REBOOT="${REBOOT:-}"
 INIT_OPTS="${INIT_OPTS:-}"
-
-# exit 0
+FSTAB_OPTS="${FSTAB_OPTS:-}"
+TMPFS_BALANCE="${TMPFS_BALANCE:-}"
+BTRFS_CONVERT_ARGS="${BTRFS_CONVERT_ARGS:-}"
 
 # systemd -> /usr/lib/systemd/systemd
 abs() { # name
   readlink -f "$(which "$1" || echo "$1")"
 }
 
-move() { # name
+move() { # name [path]
   prog="$(abs "$1")"
   dest="$2"
   [ -z "$dest" ] && dest="/bin"
@@ -25,18 +26,6 @@ move() { # name
   done
 }
 
-#wrap() {
-#  libs="$(move "$1" 1 | sort -u | tr '\n' ':')"
-#  name="$(basename "$1")"
-#  tgt="/mnt/bin/$name-wrapper"
-#  cat > "$tgt" <<EOF
-##!/bin/sh
-#LD_LIBRARY_PATH="$libs" exec "/mnt/bin/$name" \$@
-#EOF
-#  chmod +x "$tgt"
-#  [ -n "$2" ] && echo "$tgt"
-#}
-
 echo "=== installing packages ==="
 
 pkgs() {
@@ -44,9 +33,15 @@ pkgs() {
 }
 pkgs || { apt-get update; pkgs; }
 
+if mount | grep "on\s/\s" | grep btrfs; then
+  echo "Root is already btrfs!"
+  exit 0
+fi
+
 echo "=== building temporary root ==="
 
-mount -t tmpfs ramdisk /mnt
+mount -t tmpfs -o size=100% ramdisk /mnt
+df
 mkdir /mnt/{old,proc,sys,dev,run}
 mkdir -p /mnt/{bin,usr/bin}
 
@@ -57,17 +52,10 @@ cp -Lr "${linker%/*}" "/mnt${linker%/*}"
 mount --bind "/mnt${linker%/*}" "${linker%/*}"
 
 echo '
-  blockdev
   btrfs
   btrfs-convert
   e2fsck
   fuser
-  iostat
-  lsns
-  lsof
-  sshd
-  strace
-  systemctl
 ' | xargs -P 4 -I {} sh $@ -c "$(declare -f abs); $(declare -f move); move {}"
 
 # needed for btrfs-convert
@@ -77,6 +65,31 @@ move "$libgcc" "/lib"
 busybox="$(abs busybox)"
 cp "$busybox" /mnt/bin
 /mnt/bin/busybox --install /mnt/bin
+
+echo "=== replacing systemd ==="
+
+name="systemd"
+wrapper="/mnt/bin/$name-wrapper"
+cat > "$wrapper" <<EOF
+#!/bin/sh
+
+set -e -x
+
+echo 8 > /proc/sys/kernel/printk
+exec 2>/dev/kmsg >/dev/kmsg
+
+echo \$@ > /mnt/sysd_opts
+
+cd /mnt
+pivot_root . old
+exec /bin/chroot . /init
+EOF
+chmod +x "$wrapper"
+sysd="$(abs systemd)"
+mv $sysd /systemd
+ln -s "$wrapper" $sysd
+
+echo "=== writing new init ==="
 
 root="$(findmnt / --first-only --noheadings -o SOURCE)"
 root_dev="$(echo "$root" | sed 's/[0-9]\+$//')"
@@ -91,15 +104,16 @@ root="$root"
 root_dev="$root_dev"
 RECOVERY="$RECOVERY"
 REBOOT="$REBOOT"
-PATH="/bin"
+FSTAB_OPTS="$FSTAB_OPTS"
+TMPFS_BALANCE="$TMPFS_BALANCE"
+BTRFS_CONVERT_ARGS="$BTRFS_CONVERT_ARGS"
+sysd="$sysd"
+
+PATH="/bin:$PATH"
 
 EOF
 
-# TODO: replace daemon-reexec with kill
 cat >> /mnt/init <<'EOF'
-
-echo $$
-
 on_exit() {
    rc="$?"
    if [ "$rc" -eq 0 ]; then
@@ -115,9 +129,21 @@ on_exit() {
 
 trap on_exit EXIT
 
-echo "=== unmounting old root ==="
-mount --move /old/proc /proc
+echo "=== starting logger ==="
 
+mount --move /old/dev /dev
+mkfifo /log
+/bin/sh -c '
+  while IFS= read -r line; do
+    echo "<3>btrfs-convert: $line" > /dev/kmsg
+  done < /log
+' &
+exec 2> /log > /log
+echo 4 > /proc/sys/kernel/printk
+
+echo "=== unmounting old root ==="
+
+mount --move /old/proc /proc
 while ms="$(mount | grep "on /old[^ ]" | awk '{ sub("^/old", "", $3); print $3 }')"; do
   [ -z "$ms" ] && break
   m="$(echo "$ms" | head -1)"
@@ -125,121 +151,93 @@ while ms="$(mount | grep "on /old[^ ]" | awk '{ sub("^/old", "", $3); print $3 }
   mount --move "/old/$m" "/$m"
 done
 
-# systemctl daemon-reexec
-
-sync
-# /bin/sh
 fuser -SIGKILL --verbose --kill --mount /old
 umount -l "$root"
-sync
 # basically open($root, O_RDONLY | O_EXCL) with extra steps
-timeout 2s sh $INIT_OPTS -c "
+timeout 10s sh $INIT_OPTS -c "
   while e2fsck -E journal_only -n '$root' 2>&1 | grep 'is in use' > /dev/null; do
     sleep 1;
   done"
 
 echo "=== converting to btrfs ==="
-/bin/btrfs-convert -L "$root"
+
+btrfs-convert -L $BTRFS_CONVERT_ARGS "$root"
 
 echo "=== mounting btrfs root ==="
+
 mount "$root" /old
 
 echo "=== removing ext4 snapshot ==="
+
 btrfs subvolume delete /old/ext2_saved
 
 echo "=== defragging ==="
 btrfs filesystem defrag -r /old
 
 echo "=== rebalancing ==="
-# not critical and may fail if there isn't enough space
-btrfs balance start /old --full-balance || true
+(
+  seq 10 10 50 | xargs -I {} btrfs balance start /old "-dusage={}"
+
+  free_mem="$(free -b | awk '/Mem:/ { print $7 - 50 * "$mb"}')"
+  if [ \
+    -n "$failed" \
+    -a -n "$TMPFS_BALANCE"
+  ]; then
+    echo "Not enough disk space for balancing, attempting to add a tmpfs device..."
+
+    on_exit() {
+      if [ -n "$loop" ]; then
+        # if a device was added but this fails the filesystem will most likely die
+        btrfs device remove "$loop" /old || true
+        losetup -d "$loop" || true
+        rm /balance.lo || true
+      fi
+    }
+    trap on_exit EXIT
+
+    fallocate -l "$free_mem" /balance.lo
+    loop="$(losetup -f)"
+    losetup -f /balance.lo
+    btrfs device add "$loop" /old
+
+  fi
+  btrfs balance start /old --full-balance
+) || echo "WARN: Couldn't balance root!"
+
+echo "=== updating fstab ==="
+label="$(btrfs filesystem label "$root")"
+sed -i /old/etc/fstab -e \
+  "/\s\/\s/c\LABEL=$label\t/\tbtrfs\tdefaults,$FSTAB_OPTS 0 1"
 
 echo "=== fixing old root ==="
-rm /old/lib/systemd/systemd
-mv /old/systemd /old/lib/systemd/systemd
+rm "/old/$sysd"
+mv /old/systemd "/old/$sysd"
 
-# echo "=== updating fstab ==="
-# sed -i -e 's/\(\s*/\s*\)ext4/\1btrfs/' /old/etc/fstab
-# sed -i -e 's/errors=remount-ro/defaults/' /old/etc/fstab
+ls /run/systemd || true
 
-# echo "=== chrooting back ==="
+echo "=== chrooting back ==="
+while ms="$(mount | awk '!/\/proc|\/old|\s/\s/ { print $3 }')"; do
+  [ -z "$ms" ] && break
+  m="$(echo "$ms" | head -1)"
+  mount --move "/$m" "/old/$m"
+done
+mount --move /proc /old/proc
 
-# mount --move /dev /old/dev
-# mount --move /sys /old/sys
-# mount --move /proc /old/proc
-# mount --move /mnt1 /old/mnt1
-# cd /old
+reboot
+
+# sh -c '
+#   sleep 2
+#   ls /run/systemd || true
+#   # soft reboot
+#   kill -41 1
+# ' &
+
+# cd /old/
 # pivot_root . mnt
-# exec /mnt/bin/chroot . /sbin/init
-# exec chroot /old /sbin/init
-
-# echo "=== reinstalling grub ==="
-# mount -t proc proc /old/proc
-# mount -t sysfs sys /old/sys
-# mount -o bind /dev /old/dev
-# chroot /old grub-mkconfig -o /boot/grub/grub.cfg
-# chroot /old grub-install "$root_dev"
+# exec chroot . /sbin/init $(cat /mnt/sysd_opts)
 EOF
 
 chmod 0755 /mnt/init
-
-echo "=== evicting systemd ==="
-
-#path="$(find /proc/1/fd -type l | xargs -n1 readlink | grep "systemd-executor" || true)"
-#if [ -z "$path" ]; then
-#  echo "Couldn't find systemd-executor!"
-#  exit 1
-#fi
-#libs="$(move "$path" 1 | sort -u | tr '\n' ':')"
-#name="systemd-executor"
-#wrapper="/mnt/bin/$name-wrapper"
-#cat > "$wrapper" <<EOF
-##!/bin/sh
-#LD_LIBRARY_PATH="$libs" exec "/mnt/bin/$name" \$@
-#EOF
-#chmod +x "$wrapper"
-#mv "$(readlink -f "$path")" /systemd-executor
-#ln -s "$wrapper" "$path"
-
-# libs="$(move "systemd" 1 | sort -u | tr '\n' ':')"
-name="systemd"
-wrapper="/mnt/bin/$name-wrapper"
-cat > "$wrapper" <<EOF
-#!/bin/sh
-
-set -ex
-
-cd /mnt
-pivot_root . old
-/bin/mount --move /old/dev /dev
-exec /bin/chroot . /bin/sh -c '
-  /init 2>&1 | /bin/tr "\n" "\0" | /bin/xargs -0 -n1 /bin/echo "<3>" > /dev/kmsg
-'
-EOF
-chmod +x "$wrapper"
-sysd="$(abs systemd)"
-mv $sysd /systemd
-ln -s "$wrapper" $sysd
-
-# if find /proc/1/maps -type l \
-#     | xargs -n1 readlink \
-#     | xargs -n1 findmnt --nohead -o TARGET -T \
-#     | grep "^/$"; then
-#   echo "Couldn't evict systemd! Some files are still mapped from the root."
-#   echo "Contents of /proc/1/maps:"
-#   cat /proc/1/maps
-#   exit 1
-# fi
-
-# if find /proc/1/fd -type l \
-#     | xargs -n1 readlink \
-#     | xargs -n1 findmnt --nohead -o TARGET -T \
-#     | grep "^/$"; then
-#   echo "Couldn't evict systemd! Some files is still open on the root."
-#   echo "Contents of /proc/1/fd:"
-#   ls -l /proc/1/fd
-#   exit 1
-# fi
 
 echo "=== stopping all units ==="
 
@@ -263,13 +261,7 @@ modprobe btrfs
 mount --make-slave /
 mount --make-slave /mnt
 
-# exit 0
-
 cd /mnt
-# /mnt/bin/strace -v -s 4096 -x -e signal=all -e trace=all -yy -p 1 & 2>&1 \
-#   | /mnt/bin/tr "\n" "\0" | /mnt/bin/xargs -0 -n1 /mnt/bin/echo "<3>" > /dev/kmsg
-# disown %1
-
 /mnt/bin/sh -c '
   while ! systemctl is-active cloud-init.target >/dev/null; do
     sleep 1
