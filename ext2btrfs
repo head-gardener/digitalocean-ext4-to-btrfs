@@ -2,12 +2,14 @@
 
 set -e $@
 
+DRY_RUN="${DRY_RUN:-}"
 RECOVERY="${RECOVERY:-}"
-REBOOT="${REBOOT:-}"
 INIT_OPTS="${INIT_OPTS:-}"
 FSTAB_OPTS="${FSTAB_OPTS:-}"
 TMPFS_BALANCE="${TMPFS_BALANCE:-}"
 BTRFS_CONVERT_ARGS="${BTRFS_CONVERT_ARGS:-}"
+PARENT="${PARENT:-}"
+CLOUD_CLEAR_SEMAPHORE="${CLOUD_CLEAR_SEMAPHORE:-}"
 
 # systemd -> /usr/lib/systemd/systemd
 abs() { # name
@@ -26,6 +28,33 @@ move() { # name [path]
   done
 }
 
+if [ -z "$PARENT" ]; then
+  parent="$(cat "/proc/$(awk '{ print $4 }' "/proc/$$/stat")/cmdline")"
+  if echo "$parent" | grep "/cloud/"; then
+    echo "Cloud-init detected!"
+    PARENT="cloud"
+  fi
+fi
+
+if [ "$PARENT" != "cloud" ]; then
+  echo "Warning: unknown parent $PARENT. This setting will have no effect!"
+fi
+
+if [ "$CLOUD_CLEAR_SEMAPHORE" == "auto" ]; then
+  case "$(basename "$parent")" in
+    "runcmd")
+      CLOUD_CLEAR_SEMAPHORE="config_scripts_user"
+      ;;
+
+    *)
+      CLOUD_CLEAR_SEMAPHORE=""
+      echo "WARNING: Couldn't guess CLOUD_CLEAR_SEMAPHORE. This setting will have no effect!"
+      ;;
+  esac
+  [ -n "$CLOUD_CLEAR_SEMAPHORE" ] \
+    && echo "Guessing CLOUD_CLEAR_SEMAPHORE: $CLOUD_CLEAR_SEMAPHORE"
+fi
+
 echo "=== installing packages ==="
 
 pkgs() {
@@ -33,7 +62,7 @@ pkgs() {
 }
 pkgs || { apt-get update; pkgs; }
 
-if mount | grep "on\s/\s" | grep btrfs; then
+if mount | grep "on\s\+/.*btrfs"; then
   echo "Root is already btrfs!"
   exit 0
 fi
@@ -73,12 +102,13 @@ wrapper="/mnt/bin/$name-wrapper"
 cat > "$wrapper" <<EOF
 #!/bin/sh
 
-set -e -x
+set -e $INIT_OPTS
 
-echo 8 > /proc/sys/kernel/printk
-exec 2>/dev/kmsg >/dev/kmsg
+# yes, you do have to exec once for each channel
+exec >/mnt/log
+exec 2>/mnt/log
 
-echo \$@ > /mnt/sysd_opts
+echo \$@ >/mnt/sysd_opts
 
 cd /mnt
 pivot_root . old
@@ -100,13 +130,14 @@ cat > /mnt/init <<EOF
 
 set -e $INIT_OPTS
 
-root="$root"
-root_dev="$root_dev"
+DRY_RUN="$DRY_RUN"
 RECOVERY="$RECOVERY"
-REBOOT="$REBOOT"
 FSTAB_OPTS="$FSTAB_OPTS"
 TMPFS_BALANCE="$TMPFS_BALANCE"
 BTRFS_CONVERT_ARGS="$BTRFS_CONVERT_ARGS"
+
+root="$root"
+root_dev="$root_dev"
 sysd="$sysd"
 
 PATH="/bin:$PATH"
@@ -119,27 +150,16 @@ on_exit() {
    if [ "$rc" -eq 0 ]; then
      echo "=== init done ==="
      sync
-     [ -n "$REBOOT" ] && reboot -f
+     reboot -f
    else
      echo "=== init failed ==="
+     sleep 5
      sync
      [ -n "$RECOVERY" ] && /bin/sh
    fi
 }
 
 trap on_exit EXIT
-
-echo "=== starting logger ==="
-
-mount --move /old/dev /dev
-mkfifo /log
-/bin/sh -c '
-  while IFS= read -r line; do
-    echo "<3>btrfs-convert: $line" > /dev/kmsg
-  done < /log
-' &
-exec 2> /log > /log
-echo 4 > /proc/sys/kernel/printk
 
 echo "=== unmounting old root ==="
 
@@ -159,71 +179,69 @@ timeout 10s sh $INIT_OPTS -c "
     sleep 1;
   done"
 
-echo "=== converting to btrfs ==="
-
-btrfs-convert -L $BTRFS_CONVERT_ARGS "$root"
+if [ -z "$DRY_RUN" ]; then
+  echo "=== converting to btrfs ==="
+  btrfs-convert -L $BTRFS_CONVERT_ARGS "$root"
+fi
 
 echo "=== mounting btrfs root ==="
 
 mount "$root" /old
 
-echo "=== removing ext4 snapshot ==="
+if [ -z "$DRY_RUN" ]; then
+  echo "=== removing ext4 snapshot ==="
 
-btrfs subvolume delete /old/ext2_saved
+  btrfs subvolume delete /old/ext2_saved
 
-echo "=== defragging ==="
-btrfs filesystem defrag -r /old
+  echo "=== defragging ==="
 
-echo "=== rebalancing ==="
-(
-  seq 10 10 50 | xargs -I {} btrfs balance start /old "-dusage={}"
+  btrfs filesystem defrag -r /old
 
-  free_mem="$(free -b | awk '/Mem:/ { print $7 - 50 * "$mb"}')"
-  if [ \
-    -n "$failed" \
-    -a -n "$TMPFS_BALANCE"
-  ]; then
-    echo "Not enough disk space for balancing, attempting to add a tmpfs device..."
+  echo "=== rebalancing ==="
+  (
+    seq 10 10 50 | xargs -I {} btrfs balance start /old "-dusage={}"
 
-    on_exit() {
-      if [ -n "$loop" ]; then
-        # if a device was added but this fails the filesystem will most likely die
-        btrfs device remove "$loop" /old || true
-        losetup -d "$loop" || true
-        rm /balance.lo || true
-      fi
-    }
-    trap on_exit EXIT
+    free_mem="$(free -b | awk '/Mem:/ { print $7 - 50 * "$mb"}')"
+    if [ -n "$TMPFS_BALANCE" ]; then
+      echo "Not enough disk space for balancing, attempting to add a tmpfs device..."
 
-    fallocate -l "$free_mem" /balance.lo
-    loop="$(losetup -f)"
-    losetup -f /balance.lo
-    btrfs device add "$loop" /old
+      on_exit() {
+        if [ -n "$loop" ]; then
+          # if a device was added but this fails the filesystem will most likely die
+          btrfs device remove "$loop" /old || true
+          losetup -d "$loop" || true
+          rm /balance.lo || true
+        fi
+      }
+      trap on_exit EXIT
 
-  fi
-  btrfs balance start /old --full-balance
-) || echo "WARN: Couldn't balance root!"
+      fallocate -l "$free_mem" /balance.lo
+      loop="$(losetup -f)"
+      losetup -f /balance.lo
+      btrfs device add "$loop" /old
 
-echo "=== updating fstab ==="
-label="$(btrfs filesystem label "$root")"
-sed -i /old/etc/fstab -e \
-  "/\s\/\s/c\LABEL=$label\t/\tbtrfs\tdefaults,$FSTAB_OPTS 0 1"
+    fi
+    btrfs balance start /old --full-balance
+  ) || echo "WARN: Couldn't balance root!"
+
+  echo "=== updating fstab ==="
+  label="$(btrfs filesystem label "$root")"
+  sed -i /old/etc/fstab -e \
+    "/\s\/\s/c\LABEL=$label\t/\tbtrfs\tdefaults,$FSTAB_OPTS 0 1"
+fi
 
 echo "=== fixing old root ==="
 rm "/old/$sysd"
 mv /old/systemd "/old/$sysd"
 
-ls /run/systemd || true
-
-echo "=== chrooting back ==="
-while ms="$(mount | awk '!/\/proc|\/old|\s/\s/ { print $3 }')"; do
-  [ -z "$ms" ] && break
-  m="$(echo "$ms" | head -1)"
-  mount --move "/$m" "/old/$m"
-done
-mount --move /proc /old/proc
-
-reboot
+# echo "=== chrooting back ==="
+# echo ""
+# while ms="$(mount | awk '!/\/proc|\/old|\s\/\s/ { print $3 }')"; do
+#   [ -z "$ms" ] && break
+#   m="$(echo "$ms" | head -1)"
+#   mount --move "/$m" "/old/$m"
+# done
+# mount --move /proc /old/proc
 
 # sh -c '
 #   sleep 2
@@ -248,9 +266,25 @@ systemctl list-units --type=socket --plain --no-legend \
 systemctl list-units --type=service --state=running --plain --no-legend \
   | cat | awk '{ print $1 }' > /sysd-state
 systemctl list-units --type=socket --plain --no-legend \
-  | cat | grep -Ev "$preserve"| awk '{ print $1 }' | xargs systemctl stop
+  | cat | grep -Ev "$preserve"| awk '{ print $1 }' | xargs -P 4 systemctl stop
 systemctl list-units --type=service --state=running --plain --no-legend \
-  | cat | grep -Ev "$preserve" | awk '{ print $1 }' | xargs -t systemctl stop
+  | cat | grep -Ev "$preserve" | awk '{ print $1 }' | xargs -t -P 4 systemctl stop
+
+echo "=== starting logger ==="
+
+mount -t devtmpfs dev /mnt/dev
+mkfifo /mnt/log
+/bin/sh -c $'
+  exec chroot /mnt /bin/sh -c \'
+    while true; do
+      while IFS= read -r line; do
+        echo "<3>btrfs-convert: $line"
+      done < /log
+    done
+  \' > /dev/kmsg
+' &
+disown $!
+echo 'logger initialized' > /mnt/log
 
 echo "=== switching root ==="
 
@@ -262,11 +296,19 @@ mount --make-slave /
 mount --make-slave /mnt
 
 cd /mnt
-/mnt/bin/sh -c '
-  while ! systemctl is-active cloud-init.target >/dev/null; do
-    sleep 1
-  done;
+/mnt/bin/sh -c "
+  set -e $INIT_OPTS
+
+  if [ '$PARENT' == 'cloud' -a -n '$CLOUD_CLEAR_SEMAPHORE' ]; then
+    if timeout 5s sh -c 'while [ ! -f /var/lib/cloud/instance/sem/$CLOUD_CLEAR_SEMAPHORE ]; do sleep 1; done'; then
+      rm '/var/lib/cloud/instance/sem/$CLOUD_CLEAR_SEMAPHORE'
+    else
+      echo 'WARNING: couldnt clear /var/lib/cloud/instance/sem/$CLOUD_CLEAR_SEMAPHORE since it wasnt created. Ignoring!'
+    fi
+  fi;
 
   exec systemctl daemon-reexec
-' &
-disown %1
+" 2>/mnt/log 1>/mnt/log &
+disown $!
+
+[ -n "$CLOUD_CLEAR_SEMAPHORE" ] && exit 1
