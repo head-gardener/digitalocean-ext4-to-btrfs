@@ -54,3 +54,18 @@ runcmd:
       | CLOUD_CLEAR_SEMAPHORE=auto bash 2>&1 || exit 0
     echo more stuff...
 ```
+
+## How it works
+
+I wrote this to avoid using `kexec`. The basic idea is `chroot`-ing into `tmpfs`
+and converting from there:
+
+1. `tmpfs` root is created;
+1. `systemd` binary is replaced with a link to a script that `chroot`-s into
+   `init`, the later actually converts the filesystem;
+1. `systemd` runs `exev` into that script, triggered by `systemctl
+   daemon-reexec`;
+1. (Almost) all other processes get killed, freeing up the filesystem;
+
+Init script logs into `kmsg`, you can probably follow it from your provider's
+`tty` interface.
