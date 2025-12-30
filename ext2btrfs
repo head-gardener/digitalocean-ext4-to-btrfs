@@ -3,6 +3,7 @@
 set -e $@
 
 DRY_RUN="${DRY_RUN:-}"
+FAST="${FAST:-}"
 RECOVERY="${RECOVERY:-}"
 INIT_OPTS="${INIT_OPTS:-}"
 FSTAB_OPTS="${FSTAB_OPTS:-}"
@@ -131,6 +132,7 @@ cat > /mnt/init <<EOF
 set -e $INIT_OPTS
 
 DRY_RUN="$DRY_RUN"
+FAST="$FAST"
 RECOVERY="$RECOVERY"
 FSTAB_OPTS="$FSTAB_OPTS"
 TMPFS_BALANCE="$TMPFS_BALANCE"
@@ -188,7 +190,7 @@ echo "=== mounting btrfs root ==="
 
 mount "$root" /old
 
-if [ -z "$DRY_RUN" ]; then
+if [ -z "$DRY_RUN" -o -n "$FAST" ]; then
   echo "=== removing ext4 snapshot ==="
 
   btrfs subvolume delete /old/ext2_saved
@@ -202,7 +204,10 @@ if [ -z "$DRY_RUN" ]; then
     seq 10 10 50 | xargs -I {} btrfs balance start /old "-dusage={}"
 
     free_mem="$(free -b | awk '/Mem:/ { print $7 - 50 * "$mb"}')"
-    if [ -n "$TMPFS_BALANCE" ]; then
+    if [ \
+      -n "$TMPFS_BALANCE" \
+      -a "$(df -m / | awk '/\s\/$/ { print $4 }')" -le 1024 \
+    ]; then
       echo "Not enough disk space for balancing, attempting to add a tmpfs device..."
 
       on_exit() {

@@ -10,6 +10,7 @@ Digitalocean VMs.
 ## Supported params
 
 `DRY_RUN` - don't perform btrfs conversion.
+`FAST` - speed up execution by skipping initial filesystem maintenance.
 `RECOVERY` - whether to start a recovery console on init failure. Don't set
 this when your install is automated to allow it to fail fast.
 `INIT_OPTS` - bash options to set on the init script, e.g. `INIT_OPTS="-x"`.
