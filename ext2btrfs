@@ -148,17 +148,26 @@ EOF
 
 cat >> /mnt/init <<'EOF'
 on_exit() {
-   rc="$?"
-   if [ "$rc" -eq 0 ]; then
-     echo "=== init done ==="
-     sync
-     reboot -f
-   else
-     echo "=== init failed ==="
-     sleep 5
-     sync
-     [ -n "$RECOVERY" ] && /bin/sh
-   fi
+  set +e
+  rc="$?"
+  if ! findmnt /old 2>&1 >/dev/null; then
+    mount "$root" /old
+  fi
+  cp /ext2btrfs.log /old
+  if [ "$rc" -eq 0 ]; then
+    echo "=== init done ==="
+    sync
+    reboot -f
+  else
+    echo "=== init failed ==="
+    sleep 5
+    sync
+    if [ -n "$RECOVERY" ]; then
+      /bin/sh
+    else
+      reboot -f
+    fi
+  fi
 }
 
 trap on_exit EXIT
@@ -206,7 +215,7 @@ if [ -z "$DRY_RUN" -o -n "$FAST" ]; then
     free_mem="$(free -b | awk '/Mem:/ { print $7 - 50 * "$mb"}')"
     if [ \
       -n "$TMPFS_BALANCE" \
-      -a "$(df -m / | awk '/\s\/$/ { print $4 }')" -le 1024 \
+      -a "$(df -m /old | awk '/\s\/$/ { print $4 }')" -le 1024 \
     ]; then
       echo "Not enough disk space for balancing, attempting to add a tmpfs device..."
 
@@ -283,7 +292,8 @@ mkfifo /mnt/log
   exec chroot /mnt /bin/sh -c \'
     while true; do
       while IFS= read -r line; do
-        echo "<3>btrfs-convert: $line"
+        echo "<3>btrfs-convert: $line" \
+          | tee /ext2btrfs.log
       done < /log
     done
   \' > /dev/kmsg
