@@ -86,8 +86,8 @@ echo "
   btrfs
   btrfs-convert
   e2fsck
-  fuser
   findmnt
+  fuser
   $( [ -z "$SSHD" ] || echo -ne "sshd\ndhcpcd" )
 " | xargs -r -P 4 -I {} sh $@ -c "$(declare -f abs); $(declare -f move); move {}"
 
@@ -167,20 +167,30 @@ EOF
 
 cat >> /mnt/init <<'EOF'
 on_exit() {
-  set +e -x
   rc="$?"
+  set +e
   if ! findmnt /old 2>&1 >/dev/null; then
     mount "$root" /old || reboot -f
   fi
   cp /ext2btrfs.log /old
 
   echo "=== fixing old root ==="
+
   rm "/old/$sysd"
   mv /old/systemd "/old/$sysd"
+
+  echo "=== remounting old root ==="
+
+  while ms="$(mount | awk '!/\/proc|\/sys|\/dev|\/old|\/dev|\s\/\s/ { print $3 }')"; do
+    [ -z "$ms" ] && break
+    m="$(echo "$ms" | head -1)"
+    mount --move "/$m" "/old/$m"
+  done
 
   if [ "$rc" -eq 0 ]; then
     echo "=== init done ==="
     sync
+    sleep 10
     reboot -f
   else
     echo "=== init failed ==="
@@ -188,23 +198,18 @@ on_exit() {
     if [ -n "$RECOVERY" ]; then
       /bin/sh
     else
-      echo "=== chrooting back ==="
-      while ms="$(mount | awk '!/\/proc|\/old|\s\/\s/ { print $3 }')"; do
-        [ -z "$ms" ] && break
-        m="$(echo "$ms" | head -1)"
-        mount --move "/$m" "/old/$m"
-      done
-      mount --move /proc /old/proc
-
-      (
-        sleep 15
-        kill -RTMIN+15 1
-      ) &
-      cd /old/
-      pivot_root . mnt
-      exec chroot . /sbin/init $(cat /mnt/sysd_opts)
+      reboot -f
+      # (
+      #   sleep 10
+      #   kill -SIGRTMIN+15 1
+      # ) &
+      # cd /old/
+      # pivot_root . mnt
+      # exec chroot . /sbin/init $(cat /mnt/sysd_opts)
     fi
   fi
+
+  sleep 10
 }
 
 trap on_exit EXIT
@@ -245,7 +250,7 @@ timeout 10s sh $INIT_OPTS -c "
   done"
 
 if [ -z "$DRY_RUN" ]; then
-  echo "=== converting to /btrf ==="
+  echo "=== converting to btrfs ==="
   btrfs-convert -L $BTRFS_CONVERT_ARGS "$root"
 fi
 
@@ -268,7 +273,7 @@ if [ -z "$DRY_RUN" -o -n "$FAST" ]; then
 
     free_mem="$(free -b | awk '/Mem:/ { print $7 - 50 * "$mb"}')"
     if [ \
-      -n "$TMPFS_BALANCE" \
+      -n "$TMPFS_BALANCE" o \
       -a "$(df -m /old | awk '/\s\/old$/ { print $4 }')" -le 1024 \
     ]; then
       echo "Not enough disk space for balancing, attempting to add a tmpfs device..."
@@ -293,9 +298,21 @@ if [ -z "$DRY_RUN" -o -n "$FAST" ]; then
   ) || echo "WARN: Couldn't balance root!"
 
   echo "=== updating fstab ==="
-  label="$(btrfs filesystem label "$root")"
+
+  label="$(btrfs filesystem label /old)"
   sed -i /old/etc/fstab -e \
     "/\s\/\s/c\LABEL=$label\t/\tbtrfs\tdefaults,$FSTAB_OPTS 0 1"
+
+  echo "=== updating grub ==="
+
+  mount -t devtmpfs dev /old/dev
+  mount -t proc proc /old/proc
+  mount -t sysfs sys /old/sys
+  mount --move /boot /old/boot
+
+  sed -i /old/etc/default/grub \
+    -e "/GRUB_DISABLE_LINUX_UUID/c\GRUB_DISABLE_LINUX_UUID=false"
+  chroot old update-grub
 fi
 
 EOF

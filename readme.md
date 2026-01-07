@@ -13,7 +13,7 @@ Digitalocean VMs.
 `FAST` - speed up execution by skipping initial filesystem maintenance.
 `RECOVERY` - whether to start a recovery console on init failure. Don't set
 this when your install is automated to allow it to fail fast.
-`SSHD` - whether to run `sshd` in tmpfs.
+`SSHD` - whether to run `sshd` in tmpfs (doesn't work on Digitalocean somehow).
 `INIT_OPTS` - bash options to set on the init script, e.g. `INIT_OPTS="-x"`.
 `BTRFS_CONVERT_ARGS` - extra args to pass to btrfs-convert.
 `FSTAB_OPTS` - extra mount options to be added on btrfs filesystem's fstab entry,
@@ -56,6 +56,13 @@ runcmd:
       | CLOUD_CLEAR_SEMAPHORE=auto bash 2>&1 || exit 0
     echo more stuff...
 ```
+
+## Digital Ocean
+
+On digital ocean you can read script's output after `chroot` in `Recovery
+Console`. Note that you don't need to toggle anything, by default it will
+(among other things) simply show you kernel log, which is where the script
+writes.
 
 ## How it works
 
