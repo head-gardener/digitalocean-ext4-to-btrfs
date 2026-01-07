@@ -5,6 +5,7 @@ set -e $@
 DRY_RUN="${DRY_RUN:-}"
 FAST="${FAST:-}"
 RECOVERY="${RECOVERY:-}"
+SSHD="${SSHD:-}"
 INIT_OPTS="${INIT_OPTS:-}"
 FSTAB_OPTS="${FSTAB_OPTS:-}"
 TMPFS_BALANCE="${TMPFS_BALANCE:-}"
@@ -81,12 +82,14 @@ cp -Lr "${linker%/*}" "/mnt${linker%/*}"
 # don't assume symlinks, just bind mount
 mount --bind "/mnt${linker%/*}" "${linker%/*}"
 
-echo '
+echo "
   btrfs
   btrfs-convert
   e2fsck
   fuser
-' | xargs -P 4 -I {} sh $@ -c "$(declare -f abs); $(declare -f move); move {}"
+  findmnt
+  $( [ -z "$SSHD" ] || echo -ne "sshd\ndhcpcd" )
+" | xargs -r -P 4 -I {} sh $@ -c "$(declare -f abs); $(declare -f move); move {}"
 
 # needed for btrfs-convert
 libgcc="$(find /usr/lib -name libgcc_s.so.1)"
@@ -95,6 +98,21 @@ move "$libgcc" "/lib"
 busybox="$(abs busybox)"
 cp "$busybox" /mnt/bin
 /mnt/bin/busybox --install /mnt/bin
+
+if [ -n "$SSHD" ]; then
+  mkdir -p /mnt/etc
+  cp -r /etc/{shadow,passwd,ssh} /mnt/etc/
+
+  sed -i "s,/bin/bash,/bin/sh," /mnt/etc/passwd
+
+  sed -i "/UsePAM/c\UsePAM no" /mnt/etc/ssh/sshd_config /mnt/etc/ssh/sshd_config.d/*
+  sed -i "/PermitRootLogin/c\PermitRootLogin yes" /mnt/etc/ssh/sshd_config /mnt/etc/ssh/sshd_config.d/*
+  sed -i "/X11Forwarding/c\X11Forwarding no" /mnt/etc/ssh/sshd_config /mnt/etc/ssh/sshd_config.d/*
+
+  mkdir -p /mnt/root
+  cp -r /root/.ssh /mnt/root/
+  sed -i "s/.*ssh-/ssh-/" /mnt/root/.ssh/authorized_keys
+fi
 
 echo "=== replacing systemd ==="
 
@@ -134,6 +152,7 @@ set -e $INIT_OPTS
 DRY_RUN="$DRY_RUN"
 FAST="$FAST"
 RECOVERY="$RECOVERY"
+SSHD="$SSHD"
 FSTAB_OPTS="$FSTAB_OPTS"
 TMPFS_BALANCE="$TMPFS_BALANCE"
 BTRFS_CONVERT_ARGS="$BTRFS_CONVERT_ARGS"
@@ -148,31 +167,49 @@ EOF
 
 cat >> /mnt/init <<'EOF'
 on_exit() {
-  set +e
+  set +e -x
   rc="$?"
   if ! findmnt /old 2>&1 >/dev/null; then
-    mount "$root" /old
+    mount "$root" /old || reboot -f
   fi
   cp /ext2btrfs.log /old
+
+  echo "=== fixing old root ==="
+  rm "/old/$sysd"
+  mv /old/systemd "/old/$sysd"
+
   if [ "$rc" -eq 0 ]; then
     echo "=== init done ==="
     sync
     reboot -f
   else
     echo "=== init failed ==="
-    sleep 5
     sync
     if [ -n "$RECOVERY" ]; then
       /bin/sh
     else
-      reboot -f
+      echo "=== chrooting back ==="
+      while ms="$(mount | awk '!/\/proc|\/old|\s\/\s/ { print $3 }')"; do
+        [ -z "$ms" ] && break
+        m="$(echo "$ms" | head -1)"
+        mount --move "/$m" "/old/$m"
+      done
+      mount --move /proc /old/proc
+
+      (
+        sleep 15
+        kill -RTMIN+15 1
+      ) &
+      cd /old/
+      pivot_root . mnt
+      exec chroot . /sbin/init $(cat /mnt/sysd_opts)
     fi
   fi
 }
 
 trap on_exit EXIT
 
-echo "=== unmounting old root ==="
+echo "=== moving mounts ==="
 
 mount --move /old/proc /proc
 while ms="$(mount | grep "on /old[^ ]" | awk '{ sub("^/old", "", $3); print $3 }')"; do
@@ -181,6 +218,23 @@ while ms="$(mount | grep "on /old[^ ]" | awk '{ sub("^/old", "", $3); print $3 }
   mkdir -p "$m"
   mount --move "/old/$m" "/$m"
 done
+
+if [ -n "$SSHD" ]; then
+  SHELL=/bin/sh
+  echo "=== starting sshd ==="
+  dhcpcd $(ip -o link show | awk '!/loopback/ { sub(":", "", $2); printf "%s ", $2 }')
+  mkdir -p /run/sshd
+  chown root /run/sshd
+  chmod 755 /run/sshd
+  (
+    set +e
+    while :; do
+      /bin/sshd -D -d
+    done
+  ) &
+fi
+
+echo "=== unmounting old root ==="
 
 fuser -SIGKILL --verbose --kill --mount /old
 umount -l "$root"
@@ -191,7 +245,7 @@ timeout 10s sh $INIT_OPTS -c "
   done"
 
 if [ -z "$DRY_RUN" ]; then
-  echo "=== converting to btrfs ==="
+  echo "=== converting to /btrf ==="
   btrfs-convert -L $BTRFS_CONVERT_ARGS "$root"
 fi
 
@@ -215,7 +269,7 @@ if [ -z "$DRY_RUN" -o -n "$FAST" ]; then
     free_mem="$(free -b | awk '/Mem:/ { print $7 - 50 * "$mb"}')"
     if [ \
       -n "$TMPFS_BALANCE" \
-      -a "$(df -m /old | awk '/\s\/$/ { print $4 }')" -le 1024 \
+      -a "$(df -m /old | awk '/\s\/old$/ { print $4 }')" -le 1024 \
     ]; then
       echo "Not enough disk space for balancing, attempting to add a tmpfs device..."
 
@@ -244,36 +298,13 @@ if [ -z "$DRY_RUN" -o -n "$FAST" ]; then
     "/\s\/\s/c\LABEL=$label\t/\tbtrfs\tdefaults,$FSTAB_OPTS 0 1"
 fi
 
-echo "=== fixing old root ==="
-rm "/old/$sysd"
-mv /old/systemd "/old/$sysd"
-
-# echo "=== chrooting back ==="
-# echo ""
-# while ms="$(mount | awk '!/\/proc|\/old|\s\/\s/ { print $3 }')"; do
-#   [ -z "$ms" ] && break
-#   m="$(echo "$ms" | head -1)"
-#   mount --move "/$m" "/old/$m"
-# done
-# mount --move /proc /old/proc
-
-# sh -c '
-#   sleep 2
-#   ls /run/systemd || true
-#   # soft reboot
-#   kill -41 1
-# ' &
-
-# cd /old/
-# pivot_root . mnt
-# exec chroot . /sbin/init $(cat /mnt/sysd_opts)
 EOF
 
 chmod 0755 /mnt/init
 
 echo "=== stopping all units ==="
 
-preserve="ssh|cloud-init|tty|journald"
+preserve="$( [ -n "$SSHD" ] || echo -n "sshd|" )cloud-init|tty|journald"
 
 systemctl list-units --type=socket --plain --no-legend \
   | cat | awk '{ print $1 }' >> /sysd-state
@@ -290,7 +321,7 @@ mount -t devtmpfs dev /mnt/dev
 mkfifo /mnt/log
 /bin/sh -c $'
   exec chroot /mnt /bin/sh -c \'
-    while true; do
+    while :; do
       while IFS= read -r line; do
         echo "<3>btrfs-convert: $line" \
           | tee /ext2btrfs.log
